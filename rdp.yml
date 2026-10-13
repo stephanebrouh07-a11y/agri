@@ -1,0 +1,270 @@
+name: RDP Tailscale (stable)
+
+on:
+  workflow_dispatch:
+    inputs:
+      nom_machine:
+        description: "Nom Tailscale de la machine (lettres minuscules, chiffres, tirets)"
+        required: false
+        default: "gh-runner"
+      duree_minutes:
+        description: "Duree de la session en minutes (max 350, limite GitHub = 6 h)"
+        required: false
+        default: "345"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: rdp-session
+  cancel-in-progress: false
+
+jobs:
+  rdp:
+    runs-on: windows-2025   # Windows Server 2025, version figee (pas de surprise avec windows-latest)
+    # Les runners heberges par GitHub sont plafonnes a 360 min (6 h).
+    # L'ancienne valeur 3600 etait ignoree/invalide.
+    timeout-minutes: 360
+
+    env:
+      RDP_USERNAME: ${{ secrets.RDP_USERNAME || 'kipre10' }}
+      RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
+      TAILSCALE_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
+      NOM_MACHINE: ${{ inputs.nom_machine || 'gh-runner' }}
+      SESSION_MINUTES: ${{ inputs.duree_minutes || '345' }}
+
+    steps:
+      # ------------------------------------------------------------------
+      # 1. Configuration RDP : activation, securite, AUCUN timeout de session
+      # ------------------------------------------------------------------
+      - name: Configurer RDP (sans coupure de session)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          function Set-Dword($Path, $Name, $Value) {
+            if (-not (Test-Path $Path)) { New-Item -Path $Path -Force | Out-Null }
+            New-ItemProperty -Path $Path -Name $Name -Value $Value -PropertyType DWord -Force | Out-Null
+          }
+
+          $ts   = 'HKLM:\System\CurrentControlSet\Control\Terminal Server'
+          $ws   = "$ts\WinStations\RDP-Tcp"
+          $pol  = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services'
+
+          # Activer le Bureau a distance
+          Set-Dword $ts 'fDenyTSConnections' 0
+
+          # NLA + chiffrement TLS actifs (securite correcte, fonctionne avec un utilisateur local)
+          Set-Dword $ws 'UserAuthentication' 1
+          Set-Dword $ws 'SecurityLayer' 2
+
+          # Aucune limite : inactivite, deconnexion, duree de connexion
+          foreach ($n in 'MaxIdleTime','MaxDisconnectionTime','MaxConnectionTime') {
+            Set-Dword $ws $n 0
+            Set-Dword $pol $n 0
+          }
+          # Ne jamais fermer une session deconnectee, garder la session vivante (keep-alive)
+          Set-Dword $pol 'fResetBroken' 0
+          Set-Dword $pol 'KeepAliveEnable' 1
+          Set-Dword $pol 'KeepAliveInterval' 1
+          Set-Dword $pol 'fDisableAutoReconnect' 0
+          Set-Dword $ts 'KeepAliveTimeout' 1
+
+          # Pas de veille, pas d'hibernation, pas d'extinction d'ecran, pas de verrouillage
+          powercfg /change standby-timeout-ac 0
+          powercfg /change monitor-timeout-ac 0
+          powercfg /change disk-timeout-ac 0
+          powercfg /hibernate off
+          Set-Dword 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\Personalization' 'NoLockScreen' 1
+          Set-Dword 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\System' 'AllowDomainPINLogon' 0
+
+          # Pare-feu : RDP uniquement depuis le reseau Tailscale (100.64.0.0/10)
+          Disable-NetFirewallRule -DisplayGroup 'Remote Desktop' -ErrorAction SilentlyContinue
+          Get-NetFirewallRule -DisplayName 'RDP-Tailscale' -ErrorAction SilentlyContinue | Remove-NetFirewallRule
+          New-NetFirewallRule -DisplayName 'RDP-Tailscale' -Direction Inbound -Protocol TCP `
+            -LocalPort 3389 -RemoteAddress '100.64.0.0/10' -Action Allow | Out-Null
+
+          # Le service RDP redemarre tout seul s'il plante
+          Set-Service -Name TermService -StartupType Automatic
+          sc.exe failure TermService reset= 86400 actions= restart/5000/restart/5000/restart/5000 | Out-Null
+          Restart-Service -Name TermService -Force
+          Write-Host "RDP configure."
+
+      # ------------------------------------------------------------------
+      # 2. Utilisateur RDP (le mot de passe n'est JAMAIS affiche ni exporte)
+      # ------------------------------------------------------------------
+      - name: Creer ou mettre a jour l'utilisateur RDP
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $username = $env:RDP_USERNAME
+          $password = $env:RDP_PASSWORD
+
+          if ([string]::IsNullOrWhiteSpace($username)) { Write-Error "Secret RDP_USERNAME manquant."; exit 1 }
+          if ([string]::IsNullOrWhiteSpace($password)) { Write-Error "Secret RDP_PASSWORD manquant."; exit 1 }
+          if ($username.Length -gt 20)                 { Write-Error "RDP_USERNAME : 20 caracteres maximum."; exit 1 }
+          if ($password.Length -lt 8)                  { Write-Error "RDP_PASSWORD : 8 caracteres minimum (majuscule, minuscule, chiffre)."; exit 1 }
+
+          $secure = ConvertTo-SecureString $password -AsPlainText -Force
+          $existing = Get-LocalUser -Name $username -ErrorAction SilentlyContinue
+          if (-not $existing) {
+            New-LocalUser -Name $username -Password $secure -AccountNeverExpires -PasswordNeverExpires | Out-Null
+            Write-Host "Utilisateur cree : $username"
+          } else {
+            Set-LocalUser -Name $username -Password $secure -PasswordNeverExpires $true
+            Enable-LocalUser -Name $username
+            Write-Host "Utilisateur mis a jour : $username"
+          }
+
+          foreach ($group in 'Remote Desktop Users','Administrators') {
+            if (-not (Get-LocalGroupMember -Group $group -Member $username -ErrorAction SilentlyContinue)) {
+              Add-LocalGroupMember -Group $group -Member $username
+            }
+          }
+
+      # ------------------------------------------------------------------
+      # 3. Tailscale (derniere version stable, mode unattended)
+      # ------------------------------------------------------------------
+      - name: Installer Tailscale
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $msi = Join-Path $env:RUNNER_TEMP 'tailscale.msi'
+          for ($i = 1; $i -le 3; $i++) {
+            try {
+              Invoke-WebRequest -Uri 'https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi' -OutFile $msi -UseBasicParsing
+              break
+            } catch {
+              if ($i -eq 3) { throw }
+              Start-Sleep -Seconds 5
+            }
+          }
+          $p = Start-Process msiexec.exe -ArgumentList '/i', "`"$msi`"", '/quiet', '/norestart' -Wait -PassThru
+          if ($p.ExitCode -notin 0, 3010) { Write-Error "Installation Tailscale echouee (code $($p.ExitCode))."; exit 1 }
+          Remove-Item $msi -Force
+          Set-Service -Name Tailscale -StartupType Automatic
+          Start-Service -Name Tailscale -ErrorAction SilentlyContinue
+
+      - name: Connecter la machine au Tailnet
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if ([string]::IsNullOrWhiteSpace($env:TAILSCALE_AUTH_KEY)) { Write-Error "Secret TAILSCALE_AUTH_KEY manquant."; exit 1 }
+          if ($env:NOM_MACHINE -notmatch '^[a-z0-9-]{1,40}$') { Write-Error "nom_machine invalide (a-z, 0-9, tirets)."; exit 1 }
+
+          $tsExe    = "$env:ProgramFiles\Tailscale\tailscale.exe"
+          # Nom stable (pas d'ID de run) : vous pouvez toujours vous connecter a "gh-runner"
+          # grace a MagicDNS, sans chercher l'IP. La machine est retiree du Tailnet en fin de job.
+          $hostname = $env:NOM_MACHINE
+
+          # --unattended : Tailscale reste connecte meme quand aucune session Windows n'est ouverte
+          #                (cause n°1 des coupures apres 1-2 h : le tunnel tombait avec la session).
+          & $tsExe up --authkey=$env:TAILSCALE_AUTH_KEY --hostname=$hostname --unattended --accept-dns=false --reset
+          if ($LASTEXITCODE -ne 0) { Write-Error "tailscale up a echoue."; exit 1 }
+
+          $ip = $null
+          for ($i = 0; $i -lt 12 -and -not $ip; $i++) {
+            $ip = (& $tsExe ip -4 2>$null | Select-String -Pattern '\d+\.\d+\.\d+\.\d+').Matches.Value | Select-Object -First 1
+            if (-not $ip) { Start-Sleep -Seconds 5 }
+          }
+          if (-not $ip) { Write-Error "Aucune IP Tailscale attribuee."; exit 1 }
+
+          "TAILSCALE_IP=$ip"        | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "TAILSCALE_HOST=$hostname" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          Write-Host "IP Tailscale : $ip  (nom : $hostname)"
+
+      - name: Verifier que RDP repond
+        shell: pwsh
+        run: |
+          $ok = $false
+          for ($i = 1; $i -le 6 -and -not $ok; $i++) {
+            $ok = (Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port 3389 -WarningAction SilentlyContinue).TcpTestSucceeded
+            if (-not $ok) { Start-Sleep -Seconds 5 }
+          }
+          if (-not $ok) { Write-Error "Le port 3389 ne repond pas."; exit 1 }
+          Write-Host "RDP repond sur $($env:TAILSCALE_IP):3389"
+
+      # ------------------------------------------------------------------
+      # 4. Maintien de la session avec auto-reparation
+      # ------------------------------------------------------------------
+      - name: Maintenir la session (auto-reparation)
+        shell: pwsh
+        run: |
+          $tsExe = "$env:ProgramFiles\Tailscale\tailscale.exe"
+          $minutes = [Math]::Min([int]$env:SESSION_MINUTES, 350)
+          $deadline = (Get-Date).AddMinutes($minutes)
+
+          $summary = @"
+          ## Connexion RDP
+          - **Adresse** : ``$($env:TAILSCALE_IP)`` (ou ``$($env:TAILSCALE_HOST)``)
+          - **Utilisateur** : ``$($env:RDP_USERNAME)``
+          - **Mot de passe** : celui du secret ``RDP_PASSWORD``
+          - **Fin prevue** : $($deadline.ToString('HH:mm')) (heure du runner, UTC)
+          "@
+          $summary | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
+
+          Write-Host "=== RDP ACTIF ==="
+          Write-Host "Adresse     : $env:TAILSCALE_IP"
+          Write-Host "Nom         : $env:TAILSCALE_HOST"
+          Write-Host "Utilisateur : $env:RDP_USERNAME"
+          Write-Host "Fin prevue  : $deadline (UTC)"
+          Write-Host "================="
+
+          function Test-Tailscale {
+            try {
+              $j = & $tsExe status --json 2>$null | ConvertFrom-Json
+              return ($j.BackendState -eq 'Running')
+            } catch { return $false }
+          }
+
+          $tick = 0
+          while ((Get-Date) -lt $deadline) {
+            $tick++
+
+            # Service RDP
+            $svc = Get-Service -Name TermService -ErrorAction SilentlyContinue
+            if (-not $svc -or $svc.Status -ne 'Running') {
+              Write-Warning "[$(Get-Date -Format s)] TermService arrete : redemarrage."
+              Start-Service -Name TermService -ErrorAction SilentlyContinue
+            }
+
+            # Service + tunnel Tailscale
+            $tsSvc = Get-Service -Name Tailscale -ErrorAction SilentlyContinue
+            if (-not $tsSvc -or $tsSvc.Status -ne 'Running') {
+              Write-Warning "[$(Get-Date -Format s)] Service Tailscale arrete : redemarrage."
+              Start-Service -Name Tailscale -ErrorAction SilentlyContinue
+              Start-Sleep -Seconds 5
+            }
+            if (-not (Test-Tailscale)) {
+              Write-Warning "[$(Get-Date -Format s)] Tunnel Tailscale hors ligne : reconnexion."
+              & $tsExe up --authkey=$env:TAILSCALE_AUTH_KEY --hostname=$env:TAILSCALE_HOST --unattended --accept-dns=false 2>&1 | Out-Null
+            }
+
+            # Pare-feu : la regle doit rester active
+            $rule = Get-NetFirewallRule -DisplayName 'RDP-Tailscale' -ErrorAction SilentlyContinue
+            if (-not $rule -or $rule.Enabled -ne 'True') {
+              Write-Warning "[$(Get-Date -Format s)] Regle pare-feu absente : recreation."
+              Get-NetFirewallRule -DisplayName 'RDP-Tailscale' -ErrorAction SilentlyContinue | Remove-NetFirewallRule
+              New-NetFirewallRule -DisplayName 'RDP-Tailscale' -Direction Inbound -Protocol TCP `
+                -LocalPort 3389 -RemoteAddress '100.64.0.0/10' -Action Allow | Out-Null
+            }
+
+            # Battement de coeur toutes les 5 minutes
+            if ($tick % 10 -eq 0) {
+              $left = [int]($deadline - (Get-Date)).TotalMinutes
+              Write-Host "[$(Get-Date -Format s)] OK - RDP et Tailscale actifs - reste ~$left min"
+              quser 2>$null
+            }
+            Start-Sleep -Seconds 30
+          }
+          Write-Host "Duree atteinte : arret propre de la session."
+
+      # ------------------------------------------------------------------
+      # 5. Nettoyage : retirer la machine du Tailnet
+      # ------------------------------------------------------------------
+      - name: Retirer la machine du Tailnet
+        if: always()
+        shell: pwsh
+        run: |
+          $tsExe = "$env:ProgramFiles\Tailscale\tailscale.exe"
+          if (Test-Path $tsExe) { & $tsExe logout 2>&1 | Out-Null }
